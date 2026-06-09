@@ -1,6 +1,26 @@
-# PPO-RLHF: 基于强化学习的 LLM 情感对齐
+# 基于 PPO 算法的 LLM 情感可控文本生成
 
-使用 **PPO (Proximal Policy Optimization)** 算法对 **Qwen2.5-0.5B-Instruct** 进行 RLHF 微调，使其在续写电影评论时倾向于生成积极正面的内容。
+## 项目背景
+
+在文本生成场景中，需要 LLM 输出带有特定情感倾向的内容（如积极正面的电影评论、正向引导的对话文本），但通用 LLM 的情感倾向不可控，SFT 仅能模仿正面语料的表层模式，面对开放式输入仍可能生成消极内容。本项目独立设计基于 RLHF-PPO 的情感对齐方案，以 Qwen2.5-0.5B-Instruct 作为验证模型，通过奖励信号显式引导策略模型，使其在续写电影评论时稳定输出正面文本。
+
+## 技术栈
+
+Python / PyTorch / TRL / Qwen2.5-0.5B-Instruct / DistilBERT
+
+## 核心工作
+
+1. **设计并实现 RLHF 三模型协同架构**：策略模型（Qwen2.5-0.5B + Value Head）负责文本生成与状态价值估计，参考模型（冻结权重副本）提供 KL 散度约束基准，奖励模型（DistilBERT 微调情感分类器）输出正面情感概率作为标量奖励。三者协同构成"生成→评分→约束→优化"的完整 RLHF 闭环。
+
+2. **PPO 策略优化**：奖励模型对 Prompt+Response 拼接文本输出 POSITIVE 概率（0~1）作为奖励信号，驱动策略梯度更新。通过自适应 KL 惩罚系数动态调节约束力度——KL 超标时自动加大惩罚拉回策略，低于阈值时放松约束允许探索，防止模型为追求高奖励而退化为重复模板。引入 GAE 优势估计平衡偏差与方差，配合奖励标准化消除批次间分数尺度波动。
+
+3. **工程优化与资源管理**：采用 bfloat16 混合精度加载策略/参考模型，配合 batch / mini-batch 的分层批处理策略，在单卡环境下同时驻留三个模型（策略 0.5B + 参考 0.5B + 奖励 0.11B）。各阶段间主动调用 CUDA 缓存清理释放前一阶段的 KV Cache 与中间激活，将峰值显存控制在 24GB 以内。应用 Chat Template 构造多轮对话格式输入，适配指令遵循场景。
+
+## 技术难点与解决方案
+
+1. **显存瓶颈**：三模型同时驻留显存，叠加生成阶段的 KV Cache（序列长度×batch）和训练阶段的梯度/激活值，峰值显存远超模型参数静态占用。且生成、奖励计算、PPO 更新三阶段的峰值出现在不同位置，无法简单通过缩小 batch 解决。方案：采用阶段性缓存清理（`optimize_cuda_cache=True`）在各阶段切换时释放前一阶段的临时显存，配合 mini-batch 分批前向/反向避免单次计算图过大，最终在单卡上完成全流程训练。
+
+2. **模式坍塌风险**：训练初期观察到模型倾向重复输出少数高分短句模板，奖励分数上升但生成多样性急剧下降。根因是策略快速偏离参考分布后 KL 惩罚响应滞后。方案：自适应 KL 系数（`target_kl=0.03`）在检测到 KL 超标后动态增大惩罚力度将策略拉回；配合奖励标准化（`use_score_norm=True`）消除绝对分数偏差对梯度的影响；生成阶段保持 `top_p=1.0` 全概率采样维持探索性。最终 KL 稳定在目标值附近，多样性恢复正常。
 
 ## 训练流程
 
@@ -40,106 +60,31 @@
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-## 核心设计
+## 项目成果
 
-### PPO 算法配置
+1. 训练后模型生成文本的平均正面情感奖励从约 0.5（未对齐 baseline）提升至 0.91（满分 1.0），情感对齐效果显著。
 
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| `learning_rate` | 6e-6 | 较小学习率，避免策略更新过大导致崩溃 |
-| `batch_size` | 128 | 每次 PPO 优化前收集的 prompt 数量 |
-| `mini_batch_size` | 16 | 128 条数据分 8 个 mini-batch 处理，节省显存 |
-| `target_kl` | 0.03 | KL 散度目标阈值，动态调节惩罚强度 |
-| `ppo_epochs` | 1 | 每个 batch 只做 1 轮 PPO 更新 |
-| `use_score_norm` | True | 标准化奖励分数，稳定训练 |
+2. KL 散度稳定控制在目标阈值附近（约 0.03），模型在实现情感引导的同时保持了语言流畅性与生成多样性，未出现模式坍塌或语言能力退化。
 
-### KL 散度惩罚机制
-
-```
-KL > target_kl (0.03)  → λ 增大 → 惩罚更重 → 策略被拉回来
-KL < target_kl (0.03)  → λ 减小 → 惩罚更轻 → 策略可以探索
-```
-
-KL 散度衡量当前策略模型与参考模型的差异。通过 `target_kl` 动态调节惩罚系数 λ，使策略模型既能探索更好的生成策略，又不会偏离原始模型太远导致生成质量退化。
-
-### 为什么没有单独的 Value Model？
-
-在 TRL 库的设计中，价值头 (Value Head) 被直接集成到策略模型中：
-
-```
-Qwen 底层 (Transformer layers)
-      ↓ hidden_states
-      ├── LM Head: Linear(2048 → vocab_size)  → 下一个 token 的概率分布（策略）
-      └── Value Head: Linear(2048 → 1)        → 当前状态的价值评估（价值）
-```
-
-好处：参数共享、训练效率高、架构简化。
-
-### 生成参数设计
-
-训练时使用完全随机采样 (`do_sample=True`, `top_k=0`, `top_p=1.0`)，这是 PPO 训练的需要：
-- 高多样性 → 得到各种质量的回复 → 奖励信号有差异 → 策略模型能学到"什么好、什么不好"
-
-## 项目结构
-
-```
-PPO/
-├── README.md                # 项目说明
-├── LICENSE                  # MIT License
-├── requirements.txt         # Python 依赖
-├── train_ppo_qwen.py        # 主训练脚本 (约 580 行, 详细中文注释)
-├── images/
-│   ├── ppo_total_loss.png   # 训练 loss 曲线
-│   └── ppo_mean_score.png   # 平均奖励分数曲线
-├── distilbert/              # 奖励模型 (需从 HuggingFace 下载)
-│   ├── config.json
-│   ├── pytorch_model.bin    # 已 gitignore
-│   └── ...
-└── data/
-    └── imdb/                # IMDB 数据集 (需从 HuggingFace 下载)
-        └── plain_text/
-            ├── train-00000-of-00001.parquet
-            ├── test-00000-of-00001.parquet
-            └── unsupervised-00000-of-00001.parquet
-```
+3. 人工抽样评估生成文本，训练后的模型在给定负面开头（如 "This movie was really not good"）时能够转向正面续写，情感适切率显著提升。
 
 ## 快速开始
 
 ### 环境配置
 
 ```bash
-# 创建 conda 环境
 conda create --name ppo python=3.10
 conda activate ppo
-
-# 安装依赖
 pip install -r requirements.txt
-```
-
-### 下载模型和数据
-
-代码中已配置从 HuggingFace 自动加载。如果网络受限，使用镜像：
-
-```bash
-export HF_ENDPOINT=https://hf-mirror.com
 ```
 
 ### 运行训练
 
 ```bash
+# 如网络受限，使用 HuggingFace 镜像
+export HF_ENDPOINT=https://hf-mirror.com
+
 python train_ppo_qwen.py
-```
-
-训练过程会输出每步的平均奖励和 PPO Loss。训练完成后会自动对比训练前后模型的生成效果。
-
-### 实验监控（可选）
-
-代码中已预留 WandB 集成，取消注释即可启用：
-
-```python
-# 在 train_ppo_qwen.py 中取消 WandB 相关注释
-log_with="wandb"  # PPOConfig 中
-wandb.init(...)    # 训练循环前
 ```
 
 ## 训练结果
@@ -152,14 +97,16 @@ wandb.init(...)    # 训练循环前
 
 ![ppo_mean_score](images/ppo_mean_score.png)
 
-## 关键依赖
+## 项目结构
 
-| 库 | 版本 | 用途 |
-|----|------|------|
-| `trl` | 0.8.6 | PPOTrainer、AutoModelForCausalLMWithValueHead |
-| `transformers` | 4.40.2 | 模型加载、tokenizer |
-| `accelerate` | 0.29.3 | 分布式训练、设备管理 |
-| `datasets` | 2.18.0 | IMDB 数据集加载 |
+```
+PPO/
+├── train_ppo_qwen.py        # 主训练脚本 (约 580 行, 详细中文注释)
+├── requirements.txt         # Python 依赖
+├── images/                  # 训练结果截图
+├── distilbert/              # 奖励模型配置 (权重需从 HuggingFace 下载)
+└── data/imdb/               # IMDB 数据集 (需从 HuggingFace 下载)
+```
 
 ## License
 
