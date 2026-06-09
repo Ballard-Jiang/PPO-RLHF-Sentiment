@@ -1,0 +1,44 @@
+# === Large model & dataset files ===
+# Reward model (DistilBERT) - download from HuggingFace at runtime
+distilbert/pytorch_model.bin
+distilbert/tf_model.h5
+distilbert/onnx/
+# IMDB dataset - download from HuggingFace at runtime
+data/
+
+# === Training outputs ===
+qwen_ppo_sentiment_*/
+outputs/
+wandb/
+runs/
+checkpoints/
+*.pt
+*.bin
+
+# === Cache ===
+__pycache__/
+*.pyc
+*.pyo
+.cache/
+*.egg-info/
+dist/
+build/
+
+# === System files ===
+*:Zone.Identifier
+.env
+.env.local
+.DS_Store
+Thumbs.db
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Python env ===
+*.egg
+.venv/
+venv/
+env/

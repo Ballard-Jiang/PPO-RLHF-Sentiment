@@ -1,0 +1,13 @@
+trl==0.8.6 
+rich==15.0.0
+transformers==4.40.2 
+accelerate==0.29.3 
+datasets==2.18.0 
+bitsandbytes==0.43.1 
+numpy==1.26.4
+scipy 
+sentencepiece 
+protobuf 
+Jinja2
+wandb
+huggingface_hub[hf_xet]
